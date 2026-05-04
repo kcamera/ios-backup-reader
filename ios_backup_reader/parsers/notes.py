@@ -169,7 +169,9 @@ def load(backup: Backup) -> list[Note]:
                 "WHERE ZTITLE2 IS NOT NULL AND ZNOTE IS NULL"
             ):
                 folder_map[row[0]] = row[1]
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
+            # OperationalError = schema mismatch; DatabaseError = truncated/corrupt file.
+            # Either way, continue — folder names are cosmetic.
             pass
 
         # Try modern schema (iOS 13+): body is in ZICNOTEDATA joined by ZNOTE FK
@@ -183,8 +185,10 @@ def load(backup: Backup) -> list[Note]:
                    WHERE o.ZNOTE IS NULL AND o.ZTITLE1 IS NOT NULL
                    ORDER BY o.ZMODIFICATIONDATE1 DESC"""
             ))
-        except sqlite3.OperationalError:
-            # Schema mismatch — fall through to legacy query below
+        except sqlite3.Error as e:
+            # OperationalError = schema mismatch → try legacy path.
+            # DatabaseError = malformed/truncated file → also fall through (returns []).
+            print(f"notes: modern schema query failed ({type(e).__name__}: {e})", file=sys.stderr)
             modern_rows = None
 
         if modern_rows is not None:
@@ -225,10 +229,10 @@ def load(backup: Backup) -> list[Note]:
                         body_text=body,
                         has_rich_content=False,
                     ))
-            except sqlite3.OperationalError as e:
+            except sqlite3.Error as e:
                 # Neither schema matched — surface a hint to the user.
                 print(
-                    f"notes: no compatible schema in NoteStore.sqlite ({e})",
+                    f"notes: no compatible schema in NoteStore.sqlite ({type(e).__name__}: {e})",
                     file=sys.stderr,
                 )
 

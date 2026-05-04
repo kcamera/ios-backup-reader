@@ -67,11 +67,45 @@ def _resolve_path(ctx: click.Context) -> Path:
     return ctx.obj["path"]
 
 
-def _get_backup(ctx: click.Context):
+def _get_backup_raw(ctx: click.Context):
+    """Return a Backup without decryption — for metadata-only commands like `info`."""
     from .backup import Backup, BackupError
     path = _resolve_path(ctx)
     try:
         return Backup(path)
+    except BackupError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
+def _get_backup(ctx: click.Context):
+    """Return a ready-to-use Backup, prompting for a passphrase if encrypted."""
+    from .backup import Backup, BackupError
+    path = _resolve_path(ctx)
+    try:
+        backup = Backup(path)
+    except BackupError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    if not backup.is_encrypted():
+        return backup
+
+    # Encrypted — need iphone-backup-decrypt
+    try:
+        import iphone_backup_decrypt  # noqa: F401
+    except ImportError:
+        console.print(
+            "[red]Error:[/red] This backup is encrypted.\n"
+            '[yellow]Install decryption support:[/yellow] '
+            'pip install "ios-backup-reader[encrypted]"'
+        )
+        sys.exit(1)
+
+    from .backup import DecryptedBackup
+    passphrase = click.prompt("Backup passphrase", hide_input=True)
+    try:
+        return DecryptedBackup(path, passphrase)
     except BackupError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
@@ -85,7 +119,7 @@ def _get_backup(ctx: click.Context):
 @click.pass_context
 def info(ctx: click.Context) -> None:
     """Show backup metadata (device, iOS version, encryption status)."""
-    backup = _get_backup(ctx)
+    backup = _get_backup_raw(ctx)
 
     table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
     table.add_column("Field", style="bold cyan")
@@ -104,10 +138,22 @@ def info(ctx: click.Context) -> None:
     console.print(table)
 
     if encrypted:
-        console.print(
-            '[yellow]Encrypted backups require decryption. '
-            r'Install with: pip install "ios-backup-reader\[encrypted]"[/yellow]'
-        )
+        try:
+            import iphone_backup_decrypt  # noqa: F401
+            decrypt_available = True
+        except ImportError:
+            decrypt_available = False
+
+        if decrypt_available:
+            console.print(
+                "[yellow]Encrypted backup — run any data command and you will be prompted "
+                "for the passphrase.[/yellow]"
+            )
+        else:
+            console.print(
+                "[yellow]Encrypted backups require decryption support. "
+                r'Install with: pip install "ios-backup-reader[encrypted]"[/yellow]'
+            )
 
 
 # ---------------------------------------------------------------------------
