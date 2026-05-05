@@ -8,7 +8,14 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
-from rich.progress import track
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 from ..backup import Backup, attachment_backup_path
 
@@ -51,49 +58,68 @@ def _export_messages(backup: Backup, output: Path, console: Console) -> None:
     msg_dir.mkdir(parents=True, exist_ok=True)
     att_root = output / "attachments"
 
-    for chat in track(chats, description="Exporting messages…", console=console):
-        messages_out = []
-        for msg in chat.messages:
-            atts_out = []
-            for att in msg.attachments:
-                domain, rel = attachment_backup_path(att.filename)
-                export_name = Path(att.transfer_name or att.filename).name
-                dest_dir = att_root / str(chat.id)
-                dest_path = dest_dir / export_name
-                src = backup.get_file_path(domain, rel)
-                if src:
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dest_path)
-                    export_path = str(dest_path.relative_to(output))
-                else:
-                    export_path = None
-                atts_out.append({
-                    "filename": export_name,
-                    "mime_type": att.mime_type,
-                    "total_bytes": att.total_bytes,
-                    "export_path": export_path,
+    total_atts = sum(len(msg.attachments) for chat in chats for msg in chat.messages)
+
+    # Track per-attachment so the bar advances on every decrypt/copy, not per-chat.
+    # Omit TimeRemainingColumn entirely — ETA is meaningless when item cost varies.
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task(
+            f"Exporting attachments…",
+            total=total_atts if total_atts else 1,
+        )
+
+        for chat in chats:
+            messages_out = []
+            for msg in chat.messages:
+                atts_out = []
+                for att in msg.attachments:
+                    domain, rel = attachment_backup_path(att.filename)
+                    export_name = Path(att.transfer_name or att.filename).name
+                    dest_dir = att_root / str(chat.id)
+                    dest_path = dest_dir / export_name
+                    src = backup.get_file_path(domain, rel)
+                    if src:
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dest_path)
+                        backup.reclaim(src)  # free temp space on encrypted backups
+                        export_path = str(dest_path.relative_to(output))
+                    else:
+                        export_path = None
+                    atts_out.append({
+                        "filename": export_name,
+                        "mime_type": att.mime_type,
+                        "total_bytes": att.total_bytes,
+                        "export_path": export_path,
+                    })
+                    progress.advance(task)
+
+                messages_out.append({
+                    "id": msg.id,
+                    "date": _dt(msg.date),
+                    "is_from_me": msg.is_from_me,
+                    "text": msg.text,
+                    "attachments": atts_out,
                 })
 
-            messages_out.append({
-                "id": msg.id,
-                "date": _dt(msg.date),
-                "is_from_me": msg.is_from_me,
-                "text": msg.text,
-                "attachments": atts_out,
-            })
+            payload = {
+                "chat_id": chat.id,
+                "chat_identifier": chat.chat_identifier,
+                "display_name": chat.display_name,
+                "service": chat.service,
+                "handles": chat.handles,
+                "messages": messages_out,
+            }
+            out_file = msg_dir / f"{chat.id}.json"
+            out_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        payload = {
-            "chat_id": chat.id,
-            "chat_identifier": chat.chat_identifier,
-            "display_name": chat.display_name,
-            "service": chat.service,
-            "handles": chat.handles,
-            "messages": messages_out,
-        }
-        out_file = msg_dir / f"{chat.id}.json"
-        out_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    console.print(f"  [cyan]messages/[/cyan] — {len(chats)} conversation(s)")
+    console.print(f"  [cyan]messages/[/cyan] — {len(chats)} conversation(s), {total_atts} attachment(s)")
 
 
 # ---------------------------------------------------------------------------

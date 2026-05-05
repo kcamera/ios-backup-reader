@@ -8,7 +8,14 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
-from rich.progress import track
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 from ..backup import Backup, attachment_backup_path
 
@@ -59,53 +66,70 @@ def _export_messages(backup: Backup, output: Path, console: Console) -> None:
     msgs_f, msgs_w = _writer(output / "messages.csv", ["message_id", "chat_id", "date", "is_from_me", "handle_id", "text"])
     atts_f, atts_w = _writer(output / "message_attachments.csv", ["attachment_id", "message_id", "chat_id", "filename", "mime_type", "total_bytes", "export_path"])
 
-    try:
-        for chat in track(chats, description="Exporting messages…", console=console):
-            chats_w.writerow({
-                "chat_id": chat.id,
-                "chat_identifier": chat.chat_identifier,
-                "display_name": chat.display_name,
-                "service": chat.service,
-                "message_count": chat.message_count,
-            })
+    total_atts = sum(len(msg.attachments) for chat in chats for msg in chat.messages)
 
-            for msg in chat.messages:
-                msgs_w.writerow({
-                    "message_id": msg.id,
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                "Exporting attachments…",
+                total=total_atts if total_atts else 1,
+            )
+
+            for chat in chats:
+                chats_w.writerow({
                     "chat_id": chat.id,
-                    "date": _dt(msg.date),
-                    "is_from_me": int(msg.is_from_me),
-                    "handle_id": msg.handle_id or "",
-                    "text": msg.text or "",
+                    "chat_identifier": chat.chat_identifier,
+                    "display_name": chat.display_name,
+                    "service": chat.service,
+                    "message_count": chat.message_count,
                 })
 
-                for att in msg.attachments:
-                    domain, rel = attachment_backup_path(att.filename)
-                    export_name = Path(att.transfer_name or att.filename).name
-                    dest_dir = att_root / str(chat.id)
-                    dest_path = dest_dir / export_name
-                    src = backup.get_file_path(domain, rel)
-                    if src:
-                        dest_dir.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src, dest_path)
-                        export_path = str(dest_path.relative_to(output))
-                    else:
-                        export_path = ""
-                    atts_w.writerow({
-                        "attachment_id": att.id,
+                for msg in chat.messages:
+                    msgs_w.writerow({
                         "message_id": msg.id,
                         "chat_id": chat.id,
-                        "filename": export_name,
-                        "mime_type": att.mime_type,
-                        "total_bytes": att.total_bytes,
-                        "export_path": export_path,
+                        "date": _dt(msg.date),
+                        "is_from_me": int(msg.is_from_me),
+                        "handle_id": msg.handle_id or "",
+                        "text": msg.text or "",
                     })
+
+                    for att in msg.attachments:
+                        domain, rel = attachment_backup_path(att.filename)
+                        export_name = Path(att.transfer_name or att.filename).name
+                        dest_dir = att_root / str(chat.id)
+                        dest_path = dest_dir / export_name
+                        src = backup.get_file_path(domain, rel)
+                        if src:
+                            dest_dir.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(src, dest_path)
+                            backup.reclaim(src)  # free temp space on encrypted backups
+                            export_path = str(dest_path.relative_to(output))
+                        else:
+                            export_path = ""
+                        atts_w.writerow({
+                            "attachment_id": att.id,
+                            "message_id": msg.id,
+                            "chat_id": chat.id,
+                            "filename": export_name,
+                            "mime_type": att.mime_type,
+                            "total_bytes": att.total_bytes,
+                            "export_path": export_path,
+                        })
+                        progress.advance(task)
     finally:
         chats_f.close()
         msgs_f.close()
         atts_f.close()
 
-    console.print(f"  [cyan]chats.csv, messages.csv, message_attachments.csv[/cyan] — {len(chats)} conversation(s)")
+    console.print(f"  [cyan]chats.csv, messages.csv, message_attachments.csv[/cyan] — {len(chats)} conversation(s), {total_atts} attachment(s)")
 
 
 # ---------------------------------------------------------------------------

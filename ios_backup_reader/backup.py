@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import plistlib
 import shutil
 import sqlite3
@@ -213,6 +215,15 @@ class Backup:
             return None
         return _open_db_from_path(src)
 
+    def reclaim(self, path: Path) -> None:
+        """Release a file returned by get_file_path once the caller is done with it.
+
+        No-op for unencrypted backups — the file lives inside the (read-only)
+        backup directory and must not be deleted.  Subclasses that decrypt to
+        a temp directory override this to free the space immediately.
+        """
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Encrypted backup support
@@ -338,12 +349,15 @@ class DecryptedBackup(Backup):
 
         if not output.exists():
             try:
-                # domain_like with no wildcards behaves as an exact match
-                self._decryptor.extract_file(
-                    relative_path=relative_path,
-                    domain_like=domain,
-                    output_filename=str(output),
-                )
+                # Suppress the library's stdout size-mismatch WARN — it fires when
+                # the plist metadata records a pre-WAL-checkpoint size that differs
+                # from the actual encrypted file, but the decrypted content is valid.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self._decryptor.extract_file(
+                        relative_path=relative_path,
+                        domain_like=domain,
+                        output_filename=str(output),
+                    )
             except FileNotFoundError:
                 return None
             except Exception:
@@ -365,6 +379,18 @@ class DecryptedBackup(Backup):
         conn.row_factory = sqlite3.Row
         # tmp_path=None: the file is owned by _decrypt_dir, not by _TempDB
         return _TempDB(conn, tmp_path=None)
+
+    def reclaim(self, path: Path) -> None:
+        """Delete a previously decrypted temp file to free space immediately.
+
+        Safe to call after the caller has finished with the file (e.g. after
+        shutil.copy2 in the exporter).  Do NOT call on paths returned by
+        open_db — those are held open by a SQLite connection.
+        """
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
