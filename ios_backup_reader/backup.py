@@ -7,6 +7,7 @@ import io
 import plistlib
 import shutil
 import sqlite3
+import sys
 import tempfile
 import weakref
 from pathlib import Path
@@ -360,7 +361,11 @@ class DecryptedBackup(Backup):
                     )
             except FileNotFoundError:
                 return None
-            except Exception:
+            except Exception as exc:
+                print(
+                    f"decrypt: failed to extract {domain}/{relative_path}: {exc}",
+                    file=sys.stderr,
+                )
                 return None
 
         return output if output.exists() else None

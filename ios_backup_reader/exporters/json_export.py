@@ -77,11 +77,21 @@ def _export_messages(backup: Backup, output: Path, console: Console) -> None:
 
         for chat in chats:
             messages_out = []
+            used_names: set[str] = set()  # track filenames per chat to avoid collisions
             for msg in chat.messages:
                 atts_out = []
                 for att in msg.attachments:
                     domain, rel = attachment_backup_path(att.filename)
                     export_name = Path(att.transfer_name or att.filename).name
+                    # Deduplicate: append _2, _3, etc. if name already used in this chat
+                    if export_name in used_names:
+                        stem = Path(export_name).stem
+                        suffix = Path(export_name).suffix
+                        counter = 2
+                        while f"{stem}_{counter}{suffix}" in used_names:
+                            counter += 1
+                        export_name = f"{stem}_{counter}{suffix}"
+                    used_names.add(export_name)
                     dest_dir = att_root / str(chat.id)
                     dest_path = dest_dir / export_name
                     src = backup.get_file_path(domain, rel)
@@ -100,13 +110,17 @@ def _export_messages(backup: Backup, output: Path, console: Console) -> None:
                     })
                     progress.advance(task)
 
-                messages_out.append({
+                msg_dict = {
                     "id": msg.id,
                     "date": _dt(msg.date),
                     "is_from_me": msg.is_from_me,
+                    "handle_id": msg.handle_id,
                     "text": msg.text,
                     "attachments": atts_out,
-                })
+                }
+                if msg.is_recovered:
+                    msg_dict["is_recovered"] = True
+                messages_out.append(msg_dict)
 
             payload = {
                 "chat_id": chat.id,

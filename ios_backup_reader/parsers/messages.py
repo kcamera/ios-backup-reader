@@ -45,6 +45,7 @@ class Message:
     is_from_me: bool
     handle_id: Optional[int]
     attachments: list[Attachment] = field(default_factory=list)
+    is_recovered: bool = False  # True if from chat_recoverable_message_join (deleted but still in DB)
 
 
 @dataclass
@@ -130,6 +131,25 @@ def load(backup: Backup) -> list[Chat]:
             msg = messages.get(row["message_id"])
             if c and msg:
                 c.messages.append(msg)
+
+        # Recoverable (recently deleted) messages — iOS 16+ keeps them in a
+        # separate join table.  They still belong to chats and are still in the
+        # message table; they've just been moved out of chat_message_join.
+        _tables = {
+            r[0]
+            for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "chat_recoverable_message_join" in _tables:
+            for row in db.execute(
+                "SELECT chat_id, message_id FROM chat_recoverable_message_join"
+            ):
+                c = chats.get(row["chat_id"])
+                msg = messages.get(row["message_id"])
+                if c and msg:
+                    msg.is_recovered = True
+                    c.messages.append(msg)
 
         # Sort messages by date and set message counts
         for c in chats.values():

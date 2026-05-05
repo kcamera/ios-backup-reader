@@ -63,7 +63,7 @@ def _export_messages(backup: Backup, output: Path, console: Console) -> None:
     att_root = output / "attachments"
 
     chats_f, chats_w = _writer(output / "chats.csv", ["chat_id", "chat_identifier", "display_name", "service", "message_count"])
-    msgs_f, msgs_w = _writer(output / "messages.csv", ["message_id", "chat_id", "date", "is_from_me", "handle_id", "text"])
+    msgs_f, msgs_w = _writer(output / "messages.csv", ["message_id", "chat_id", "date", "is_from_me", "handle_id", "text", "is_recovered"])
     atts_f, atts_w = _writer(output / "message_attachments.csv", ["attachment_id", "message_id", "chat_id", "filename", "mime_type", "total_bytes", "export_path"])
 
     total_atts = sum(len(msg.attachments) for chat in chats for msg in chat.messages)
@@ -91,6 +91,7 @@ def _export_messages(backup: Backup, output: Path, console: Console) -> None:
                     "message_count": chat.message_count,
                 })
 
+                used_names: set[str] = set()  # track filenames per chat to avoid collisions
                 for msg in chat.messages:
                     msgs_w.writerow({
                         "message_id": msg.id,
@@ -99,11 +100,21 @@ def _export_messages(backup: Backup, output: Path, console: Console) -> None:
                         "is_from_me": int(msg.is_from_me),
                         "handle_id": msg.handle_id or "",
                         "text": msg.text or "",
+                        "is_recovered": int(msg.is_recovered),
                     })
 
                     for att in msg.attachments:
                         domain, rel = attachment_backup_path(att.filename)
                         export_name = Path(att.transfer_name or att.filename).name
+                        # Deduplicate: append _2, _3, etc. if name already used in this chat
+                        if export_name in used_names:
+                            stem = Path(export_name).stem
+                            suffix = Path(export_name).suffix
+                            counter = 2
+                            while f"{stem}_{counter}{suffix}" in used_names:
+                                counter += 1
+                            export_name = f"{stem}_{counter}{suffix}"
+                        used_names.add(export_name)
                         dest_dir = att_root / str(chat.id)
                         dest_path = dest_dir / export_name
                         src = backup.get_file_path(domain, rel)

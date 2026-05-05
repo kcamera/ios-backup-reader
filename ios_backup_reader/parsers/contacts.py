@@ -73,8 +73,9 @@ def load(backup: Backup) -> list[Contact]:
         try:
             for row in db.execute("SELECT ROWID, value FROM ABMultiValueLabel"):
                 label_map[row["ROWID"]] = row["value"] or ""
-        except Exception:
-            pass
+        except Exception as e:
+            import sys
+            print(f"contacts: ABMultiValueLabel lookup failed ({e})", file=sys.stderr)
 
         # multi-values per person
         phones: dict[int, list[ContactValue]] = {}
