@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import plistlib
 import shutil
 import sqlite3
+import sys
 import tempfile
 import weakref
 from pathlib import Path
@@ -22,7 +25,7 @@ _FLAG_FILE = 1
 class _TempDB:
     """sqlite3 connection backed by a temporary copy of a backup database."""
 
-    def __init__(self, conn: sqlite3.Connection, tmp_path: str) -> None:
+    def __init__(self, conn: sqlite3.Connection, tmp_path: str | None) -> None:
         self._conn = conn
         self._tmp_path = tmp_path
 
@@ -37,7 +40,8 @@ class _TempDB:
 
     def close(self) -> None:
         self._conn.close()
-        Path(self._tmp_path).unlink(missing_ok=True)
+        if self._tmp_path is not None:
+            Path(self._tmp_path).unlink(missing_ok=True)
 
 
 def _open_db_from_path(src: Path) -> _TempDB:
@@ -211,6 +215,187 @@ class Backup:
         if src is None:
             return None
         return _open_db_from_path(src)
+
+    def reclaim(self, path: Path) -> None:
+        """Release a file returned by get_file_path once the caller is done with it.
+
+        No-op for unencrypted backups — the file lives inside the (read-only)
+        backup directory and must not be deleted.  Subclasses that decrypt to
+        a temp directory override this to free the space immediately.
+        """
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Encrypted backup support
+# ---------------------------------------------------------------------------
+
+def _cleanup_decrypted(state: dict, decrypt_dir: Path | None) -> None:
+    """Finalizer for DecryptedBackup: close manifest conn + wipe decrypted temp dir.
+
+    Mirrors _cleanup_manifest but also removes the entire temp directory that
+    holds all on-demand-decrypted files.
+    """
+    conn = state.get("conn")
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        state["conn"] = None
+        state["tmp"] = None
+    if decrypt_dir is not None:
+        shutil.rmtree(decrypt_dir, ignore_errors=True)
+
+
+class DecryptedBackup(Backup):
+    """Backup subclass that transparently decrypts an encrypted iOS backup.
+
+    Uses ``iphone-backup-decrypt`` to:
+    1. Derive AES keys from ``Manifest.plist`` using the passphrase.
+    2. Decrypt ``Manifest.db`` so file lookups work normally.
+    3. Decrypt individual databases / attachment files on demand.
+
+    All decrypted material lands in a private temp directory that is removed
+    when the instance is closed or garbage-collected.
+    """
+
+    def __init__(self, path: str | Path, passphrase: str) -> None:
+        # Mirror the parent's init ordering: cleanup state first so the
+        # finalizer is safe even if construction fails part-way through.
+        self._info = None
+        self._manifest_props = None
+        self._manifest_state: dict = {"conn": None, "tmp": None}
+        self._finalizer: weakref.finalize | None = None
+        self._decryptor = None
+        self._decrypt_dir: Path | None = None
+
+        self.path = Path(path)
+
+        # Basic sanity checks (same as Backup._validate)
+        if not self.path.is_dir():
+            raise BackupError(f"Not a directory: {self.path}")
+        if not (self.path / "Manifest.db").exists():
+            raise BackupError(
+                f"No Manifest.db found — not a valid iOS backup: {self.path}"
+            )
+
+        try:
+            from iphone_backup_decrypt import EncryptedBackup as _EB  # type: ignore[import]
+        except ImportError:
+            raise BackupError(
+                "Encrypted backup support not installed. "
+                'Run: pip install "ios-backup-reader[encrypted]"'
+            )
+
+        # Scratch space for all decrypted output
+        self._decrypt_dir = Path(tempfile.mkdtemp(prefix="ios_backup_dec_"))
+
+        try:
+            self._decryptor = _EB(
+                backup_directory=str(self.path), passphrase=passphrase
+            )
+            # Decrypts + validates Manifest.db; raises ValueError on bad passphrase
+            self._decryptor.test_decryption()
+        except ValueError as exc:
+            shutil.rmtree(self._decrypt_dir, ignore_errors=True)
+            self._decrypt_dir = None
+            raise BackupError(
+                "Incorrect passphrase — unable to decrypt backup."
+            ) from exc
+        except Exception as exc:
+            shutil.rmtree(self._decrypt_dir, ignore_errors=True)
+            self._decrypt_dir = None
+            raise BackupError(f"Failed to open encrypted backup: {exc}") from exc
+
+        # Copy the decrypted Manifest.db into our temp dir so we own its lifetime
+        tmp_manifest = str(self._decrypt_dir / "Manifest.db")
+        try:
+            self._decryptor.save_manifest_file(output_filename=tmp_manifest)
+        except Exception as exc:
+            shutil.rmtree(self._decrypt_dir, ignore_errors=True)
+            self._decrypt_dir = None
+            raise BackupError(
+                f"Failed to save decrypted Manifest.db: {exc}"
+            ) from exc
+
+        conn = sqlite3.connect(tmp_manifest)
+        conn.row_factory = sqlite3.Row
+        self._manifest_state["conn"] = conn
+        self._manifest_state["tmp"] = tmp_manifest  # informational only; dir cleaned below
+
+        # Register finalizer. Captures only plain values (not self), so it
+        # doesn't keep this instance alive.
+        self._finalizer = weakref.finalize(
+            self, _cleanup_decrypted, self._manifest_state, self._decrypt_dir
+        )
+
+    # ------------------------------------------------------------------
+    # File access — decrypt on demand to _decrypt_dir
+    # ------------------------------------------------------------------
+
+    def get_file_path(self, domain: str, relative_path: str) -> Path | None:
+        """Decrypt the requested file into the temp dir and return its path.
+
+        The decrypted file is cached by ``fileID`` so repeated lookups for the
+        same file don't re-decrypt.
+        """
+        file_id = self._file_id(domain, relative_path)
+        if file_id is None:
+            return None
+
+        # Cache by file_id to avoid decrypting the same file twice
+        assert self._decrypt_dir is not None
+        output = self._decrypt_dir / file_id
+
+        if not output.exists():
+            try:
+                # Suppress the library's stdout size-mismatch WARN — it fires when
+                # the plist metadata records a pre-WAL-checkpoint size that differs
+                # from the actual encrypted file, but the decrypted content is valid.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self._decryptor.extract_file(
+                        relative_path=relative_path,
+                        domain_like=domain,
+                        output_filename=str(output),
+                    )
+            except FileNotFoundError:
+                return None
+            except Exception as exc:
+                print(
+                    f"decrypt: failed to extract {domain}/{relative_path}: {exc}",
+                    file=sys.stderr,
+                )
+                return None
+
+        return output if output.exists() else None
+
+    def open_db(self, domain: str, relative_path: str) -> _TempDB | None:
+        """Decrypt a database and return a _TempDB connection wrapper.
+
+        The decrypted file lives in ``_decrypt_dir`` and is cleaned up when
+        the ``DecryptedBackup`` is closed.  We open it directly (no extra
+        copy) since the temp dir is already writable scratch space.
+        """
+        src = self.get_file_path(domain, relative_path)
+        if src is None:
+            return None
+        conn = sqlite3.connect(str(src))
+        conn.row_factory = sqlite3.Row
+        # tmp_path=None: the file is owned by _decrypt_dir, not by _TempDB
+        return _TempDB(conn, tmp_path=None)
+
+    def reclaim(self, path: Path) -> None:
+        """Delete a previously decrypted temp file to free space immediately.
+
+        Safe to call after the caller has finished with the file (e.g. after
+        shutil.copy2 in the exporter).  Do NOT call on paths returned by
+        open_db — those are held open by a SQLite connection.
+        """
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
